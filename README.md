@@ -1,5 +1,5 @@
 Buka terminal dan masukkan perintah di bawah ini untuk mengubah izin pada skrip.
 
-chmod +x LinuxAudit.sh
+- `chmod +x linux-audit-tot.sh`.
 
-Execute ./LinuxAudit.sh
+- `./linux-audit-tot.sh || bash linux-audit-tot.sh`.
