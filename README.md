@@ -16,6 +16,8 @@ Skrip mendukung **berbagai distribusi Linux** termasuk:
 
 ---
 
+![Screen Capture](https://raw.githubusercontent.com/gagaltotal/linux-audit-lur/refs/heads/main/Screenshot%20from%202026-05-05%2012-54-34.png)
+
 ## Fitur Utama
 
 ### 1. **System Information Audit**
