@@ -1208,7 +1208,7 @@ main() {
     tput clear 2>/dev/null || clear 2>/dev/null || true
     
     echo "  ██╗     ██╗███╗   ██╗██╗   ██╗██╗  ██╗ █████╗ ██╗   ██╗██████╗ ██╗████████╗██╗     ██╗   ██╗██████╗  "
-    echo "  ██║     ██║████╗  ██║██║   ██╗╚██╗██╔╝██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝██║     ██║   ██║██╔══██╗ "
+    echo "  ██║     ██║████╗  ██║██║   ██║╚██╗██╔╝██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝██║     ██║   ██║██╔══██╗ "
     echo "  ██║     ██║██╔██╗ ██║██║   ██╗ ╚███╔╝ ███████║██║   ██║██║  ██║██║   ██║   ██║     ██║   ██║██████╔╝ "
     echo "  ██║     ██║██║╚██╗██║██║   ██╗ ██╔██╗ ██╔══██║██║   ██║██║  ██║██║   ██║   ██║     ██║   ██║██╔══██╗ "
     echo "  ███████╗██║██║ ╚████║╚██████╔╝██╔╝ ██╗██║  ██║╚██████╔╝██████╔╝██║   ██║   ███████╗╚██████╔╝██║  ██║ "
@@ -1258,18 +1258,36 @@ main() {
     
     SECONDS=0
     
-    {
-        perform_audit
-    } 2>&1 | tee >(sed 's/\x1b\[[0-9;]*m//g' > "$output_file")
-    
+    echo -e "${CYAN}[~] Memulai audit...${NC}"
     echo ""
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  ✓ Audit selesai!${NC}"
-    echo -e "${GREEN}  Hasil disimpan di: $output_file${NC}"
-    echo -e "${GREEN}  Waktu eksekusi   : $SECONDS detik${NC}"
-    echo -e "${GREEN}  Selesai pada     : $(date)${NC}"
-    echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
     
+    perform_audit 2>&1 | tee "$TEMP_OUTPUT"
+    
+    if [[ -f "$TEMP_OUTPUT" ]] && [[ -s "$TEMP_OUTPUT" ]]; then
+        if command -v sed &>/dev/null; then
+            sed 's/\x1b\[[0-9;]*m//g' "$TEMP_OUTPUT" > "$OUTPUT_FILE"
+        else
+            cp "$TEMP_OUTPUT" "$OUTPUT_FILE"
+        fi
+
+        if [[ -f "$OUTPUT_FILE" ]] && [[ -s "$OUTPUT_FILE" ]]; then
+            echo ""
+            echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
+            echo -e "${GREEN}  ✓ Audit selesai!${NC}"
+            echo -e "${GREEN}  Hasil disimpan di: $OUTPUT_FILE${NC}"
+            echo -e "${GREEN}  Ukuran file      : $(du -h "$OUTPUT_FILE" | cut -f1)${NC}"
+            echo -e "${GREEN}  Baris            : $(wc -l < "$OUTPUT_FILE")${NC}"
+            echo -e "${GREEN}  Waktu eksekusi   : $SECONDS detik${NC}"
+            echo -e "${GREEN}  Selesai pada     : $(date)${NC}"
+            echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
+        else
+            echo -e "${RED}ERROR: Gagal membuat file output final${NC}" >&2
+            echo -e "${YELLOW}File temporary tersedia di: $TEMP_OUTPUT${NC}" >&2
+        fi
+    else
+        echo -e "${RED}ERROR: Gagal membuat file temporary${NC}" >&2
+    fi
+
     if [[ -f "$LOG_FILE" ]] && [[ -s "$LOG_FILE" ]]; then
         echo ""
         echo -e "${YELLOW}[!] Ada error selama audit. Detail: $LOG_FILE${NC}"
