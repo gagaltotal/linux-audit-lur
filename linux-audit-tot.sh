@@ -1,20 +1,19 @@
 #!/bin/bash
 # ============================================================================
 # Linux Security Audit Script - Gagaltotal666
-# Version: 2.0 - Multi-Distro Support
+# Version: 2.3
 # Supported: Debian/Ubuntu, RHEL/CentOS/Fedora, Arch, SUSE, Alpine, dll
 # ============================================================================
 
-# Strict mode dengan pengecualian yang aman
 set -o pipefail
-# Tidak menggunakan 'set -e' karena banyak perintah yang boleh gagal
 
 # ==================== GLOBAL VARIABLES ====================
-readonly SCRIPT_VERSION="2.0"
+readonly SCRIPT_VERSION="2.3"
 readonly TIMESTAMP=$(date +"%Y%m%d-%H%M%S")
 readonly HOSTNAME_VAR=$(hostname 2>/dev/null || echo "unknown")
 readonly OUTPUT_DIR="LinuxAudit-${HOSTNAME_VAR}-${TIMESTAMP}"
 readonly OUTPUT_FILE="${OUTPUT_DIR}/LinuxAudit.txt"
+readonly TEMP_OUTPUT="/tmp/linux_audit_temp_${TIMESTAMP}.txt"
 readonly LOG_FILE="${OUTPUT_DIR}/audit_errors.log"
 DISTRO_FAMILY=""
 
@@ -25,12 +24,10 @@ if [[ -t 1 ]] && command -v tput &>/dev/null && [[ $(tput colors 2>/dev/null || 
     YELLOW='\033[1;33m'
     BLUE='\033[0;34m'
     CYAN='\033[0;36m'
-    MAGENTA='\033[0;35m'
     NC='\033[0m'
     BOLD='\033[1m'
-    DIM='\033[2m'
 else
-    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' MAGENTA='' NC='' BOLD='' DIM=''
+    RED='' GREEN='' YELLOW='' BLUE='' CYAN='' NC='' BOLD=''
 fi
 
 # ==================== TRAP HANDLERS ====================
@@ -39,6 +36,7 @@ trap 'ctrl_c' INT TERM
 
 cleanup() {
     local exit_code=$?
+    rm -f "$TEMP_OUTPUT" 2>/dev/null
     if [[ -f "$LOG_FILE" ]] && [[ -s "$LOG_FILE" ]]; then
         echo -e "\n${YELLOW}[!] Error log tersimpan di: $LOG_FILE${NC}" >&2
     else
@@ -49,16 +47,29 @@ cleanup() {
 
 ctrl_c() {
     echo -e "\n${RED}** Anda menekan Ctrl+C... Keluar${NC}" >&2
+    rm -f "$TEMP_OUTPUT" 2>/dev/null
     exit 130
 }
 
 # ==================== UTILITY FUNCTIONS ====================
-# Logging error tanpa menghentikan script
 log_error() {
     echo "[ERROR][$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-# Safe exec - menjalankan perintah dengan error handling
+is_ignored_error() {
+    local error_msg="$1"
+    [[ "$error_msg" =~ ^du:.*cannot\ access.*\/proc ]] && return 0
+    [[ "$error_msg" =~ ^du:.*cannot\ read.*\/proc ]] && return 0
+    [[ "$error_msg" =~ ^find:.*\/proc ]] && return 0
+    [[ "$error_msg" =~ ^find:.*\/sys ]] && return 0
+    [[ "$error_msg" =~ ^grep:.*\/proc ]] && return 0
+    [[ "$error_msg" =~ ^cat:.*\/proc ]] && return 0
+    [[ "$error_msg" =~ Permission\ denied ]] && return 0
+    [[ "$error_msg" =~ Operation\ not\ permitted ]] && return 0
+    [[ "$error_msg" =~ broken\ pipe ]] && return 0
+    return 1
+}
+
 safe_exec() {
     if [[ $# -eq 0 ]]; then
         log_error "safe_exec dipanggil tanpa argumen"
@@ -73,17 +84,24 @@ safe_exec() {
         return 127
     fi
     
-    "$cmd" "$@" 2>>"$LOG_FILE"
+    local stderr_file
+    stderr_file=$(mktemp 2>/dev/null || echo "/tmp/safe_exec_err_$$")
+    
+    "$cmd" "$@" 2>"$stderr_file"
     local status=$?
     
     if [[ $status -ne 0 ]] && [[ $status -ne 141 ]]; then
-        log_error "Gagal menjalankan: $cmd $* (exit code: $status)"
+        while IFS= read -r line; do
+            if ! is_ignored_error "$line"; then
+                log_error "[$cmd] $line"
+            fi
+        done < "$stderr_file"
     fi
     
+    rm -f "$stderr_file" 2>/dev/null
     return $status
 }
 
-# Safe find - dengan timeout dan error handling
 safe_find() {
     local start_dir="${1:-/}"
     shift
@@ -93,7 +111,11 @@ safe_find() {
         return 127
     fi
     
-    timeout 30 find "$start_dir" "$@" 2>/dev/null
+    local exclude_args=()
+    exclude_args+=(! -path "/proc/*")
+    exclude_args+=(! -path "/sys/*")
+    
+    timeout 30 find "$start_dir" "${exclude_args[@]}" "$@" 2>/dev/null
     local status=$?
     
     if [[ $status -eq 124 ]]; then
@@ -104,7 +126,6 @@ safe_find() {
     return 0
 }
 
-# Print section header
 print_header() {
     local title="$1"
     local line="═══════════════════════════════════════════════════════════════════════════════"
@@ -113,19 +134,14 @@ print_header() {
     printf "${CYAN}%s${NC}\n" "$line"
 }
 
-# Print sub-header
 print_sub() {
     printf "\n${GREEN}[+] %s${NC}\n" "$1"
 }
 
 # ==================== DISTRO DETECTION ====================
 detect_distro() {
-    local distro=""
-    local version=""
-    local family=""
-    local id=""
+    local distro="" version="" family="" id=""
     
-    # Method 1: /etc/os-release (standar modern)
     if [[ -f /etc/os-release ]]; then
         while IFS='=' read -r key value; do
             value="${value#\"}"
@@ -138,55 +154,31 @@ detect_distro() {
         done < /etc/os-release
         
         case "$id" in
-            ubuntu|debian|linuxmint|pop|kali|parrot|mx)
-                family="debian"
-                ;;
-            centos|rhel|fedora|rocky|almalinux|ol|oraclelinux|scientific)
-                family="rhel"
-                ;;
-            arch|manjaro|endeavouros|garuda|cachyos)
-                family="arch"
-                ;;
-            opensuse-leap|opensuse-tumbleweed|sles|sle-hpc)
-                family="suse"
-                ;;
-            alpine)
-                family="alpine"
-                ;;
-            gentoo|funtoo)
-                family="gentoo"
-                ;;
-            void)
-                family="void"
-                ;;
-            slackware)
-                family="slackware"
-                ;;
-            *)
-                family="other"
-                ;;
+            ubuntu|debian|linuxmint|pop|kali|parrot|mx) family="debian" ;;
+            centos|rhel|fedora|rocky|almalinux|ol|oraclelinux|scientific) family="rhel" ;;
+            arch|manjaro|endeavouros|garuda|cachyos) family="arch" ;;
+            opensuse-leap|opensuse-tumbleweed|sles|sle-hpc) family="suse" ;;
+            alpine) family="alpine" ;;
+            gentoo|funtoo) family="gentoo" ;;
+            void) family="void" ;;
+            slackware) family="slackware" ;;
+            *) family="other" ;;
         esac
-    # Method 2: Red Hat specific
     elif [[ -f /etc/redhat-release ]]; then
         distro=$(cat /etc/redhat-release 2>/dev/null)
         family="rhel"
-    # Method 3: SUSE specific
     elif [[ -f /etc/SuSE-release ]]; then
         distro=$(cat /etc/SuSE-release 2>/dev/null | head -1)
         family="suse"
-    # Method 4: Arch specific
     elif [[ -f /etc/arch-release ]]; then
         distro="Arch Linux"
         family="arch"
-    # Method 5: Alpine specific
     elif [[ -f /etc/alpine-release ]]; then
         distro="Alpine Linux $(cat /etc/alpine-release 2>/dev/null)"
         family="alpine"
-    # Method 6: Gentoo specific
     elif [[ -f /etc/gentoo-release ]]; then
         distro=$(cat /etc/gentoo-release 2>/dev/null)
         family="gentoo"
-    # Method 7: Slackware specific
     elif [[ -f /etc/slackware-version ]]; then
         distro="Slackware $(cat /etc/slackware-version 2>/dev/null)"
         family="slackware"
@@ -198,7 +190,6 @@ detect_distro() {
     distro="${distro:-Unknown}"
     version="${version:-Unknown}"
     family="${family:-unknown}"
-    
     DISTRO_FAMILY="$family"
     
     echo "${distro}|${version}|${family}"
@@ -208,7 +199,6 @@ detect_distro() {
 get_webserver_log_path() {
     local server="$1"
     local family="${DISTRO_FAMILY:-debian}"
-    
     case "$server" in
         apache|httpd)
             case "$family" in
@@ -216,19 +206,14 @@ get_webserver_log_path() {
                 rhel|suse|arch|*) echo "/var/log/httpd" ;;
             esac
             ;;
-        nginx)
-            echo "/var/log/nginx"
-            ;;
-        *)
-            echo ""
-            ;;
+        nginx) echo "/var/log/nginx" ;;
+        *) echo "" ;;
     esac
 }
 
 get_webserver_service_name() {
     local server="$1"
     local family="${DISTRO_FAMILY:-debian}"
-    
     case "$server" in
         apache|httpd)
             case "$family" in
@@ -236,18 +221,13 @@ get_webserver_service_name() {
                 rhel|suse|arch|*) echo "httpd" ;;
             esac
             ;;
-        nginx)
-            echo "nginx"
-            ;;
-        *)
-            echo ""
-            ;;
+        nginx) echo "nginx" ;;
+        *) echo "" ;;
     esac
 }
 
 get_package_manager() {
     local family="${DISTRO_FAMILY:-unknown}"
-    
     case "$family" in
         debian) echo "apt" ;;
         rhel) echo "yum" ;;
@@ -261,14 +241,9 @@ get_package_manager() {
 
 get_auth_log_path() {
     local family="${DISTRO_FAMILY:-unknown}"
-    
     case "$family" in
-        debian)
-            echo "/var/log/auth.log"
-            ;;
-        rhel|suse|arch|*)
-            echo "/var/log/secure"
-            ;;
+        debian) echo "/var/log/auth.log" ;;
+        rhel|suse|arch|*) echo "/var/log/secure" ;;
     esac
 }
 
@@ -299,7 +274,7 @@ audit_system_information() {
     if command -v lscpu &>/dev/null; then
         lscpu 2>/dev/null | grep -E "^(Architecture|CPU\(s\)|Model name|Thread|Core|Socket|CPU MHz|Cache size|Virtualization)" || true
     else
-        safe_exec cat /proc/cpuinfo 2>/dev/null | grep -E "^(model name|processor|cpu cores|cpu MHz)" | head -20
+        grep -E "^(model name|processor|cpu cores|cpu MHz)" /proc/cpuinfo 2>/dev/null | head -20
     fi
     
     print_sub "Disk Space Usage"
@@ -308,13 +283,30 @@ audit_system_information() {
     fi
     
     print_sub "Disk Usage by Directory (Top 15)"
-    safe_exec du -h --max-depth=1 / 2>/dev/null | sort -rh | head -15
+    
+    if du --help 2>/dev/null | grep -q '\-\-exclude'; then
+        du -h --max-depth=1 \
+            --exclude='/proc' \
+            --exclude='/sys' \
+            --exclude='/dev' \
+            --exclude='/run' \
+            --exclude='/tmp' \
+            --exclude='/snap' \
+            / 2>/dev/null | sort -rh | head -15
+    else
+        local -a scan_dirs=("/home" "/var" "/usr" "/opt" "/root" "/srv")
+        for dir in "${scan_dirs[@]}"; do
+            if [[ -d "$dir" ]]; then
+                du -h --max-depth=1 "$dir" 2>/dev/null || true
+            fi
+        done | sort -rh | head -15
+    fi
     
     print_sub "Memory Information"
     if command -v free &>/dev/null; then
         free -h 2>/dev/null
     else
-        safe_exec cat /proc/meminfo 2>/dev/null | head -15
+        head -15 /proc/meminfo 2>/dev/null
     fi
     
     print_sub "Swap Information"
@@ -354,7 +346,7 @@ audit_system_information() {
     
     echo "--- System Crontab ---"
     if [[ -f /etc/crontab ]]; then
-        safe_exec cat /etc/crontab
+        cat /etc/crontab 2>/dev/null
     fi
     
     echo ""
@@ -363,7 +355,7 @@ audit_system_information() {
         if [[ -d "$cron_dir" ]]; then
             echo ""
             echo "=== $cron_dir ==="
-            safe_exec ls -la "$cron_dir" 2>/dev/null
+            ls -la "$cron_dir" 2>/dev/null
         fi
     done
     
@@ -422,7 +414,6 @@ audit_users_and_groups() {
     printf "%-20s %-8s %-15s %-30s\n" "USERNAME" "UID" "GID" "SHELL"
     printf "%-20s %-8s %-15s %-30s\n" "--------" "---" "---" "-----"
     while IFS=: read -r username _ uid gid _ home shell; do
-        # Skip nologin shells
         case "$shell" in
             */nologin|*/false|*/sync|*/halt|*/shutdown) continue ;;
         esac
@@ -435,7 +426,7 @@ audit_users_and_groups() {
     if [[ -n "$uid0_users" ]]; then
         echo "$uid0_users" | while read -r user; do
             if [[ "$user" != "root" ]]; then
-                echo "${RED}WARNING: $user has UID 0!${NC}"
+                echo "WARNING: $user has UID 0!"
             else
                 echo "root (expected)"
             fi
@@ -447,13 +438,13 @@ audit_users_and_groups() {
         local empty_pass
         empty_pass=$(awk -F: '($2 == "" || $2 == "!"){print $1}' /etc/shadow 2>/dev/null)
         if [[ -n "$empty_pass" ]]; then
-            echo "${RED}WARNING: Users with empty or disabled passwords:${NC}"
+            echo "WARNING: Users with empty or disabled passwords:"
             echo "$empty_pass"
         else
             echo "(no empty passwords found)"
         fi
     else
-        echo "${YELLOW}Cannot read /etc/shadow (root required)${NC}"
+        echo "Cannot read /etc/shadow (root required)"
     fi
     
     print_sub "Password Policy (/etc/login.defs)"
@@ -488,7 +479,7 @@ audit_users_and_groups() {
     if [[ -r /etc/sudoers ]]; then
         grep -vE '^#|^$|^Defaults' /etc/sudoers 2>/dev/null || echo "(empty)"
     else
-        echo "${YELLOW}Cannot read /etc/sudoers${NC}"
+        echo "Cannot read /etc/sudoers"
     fi
     
     print_sub "PAM Configuration"
@@ -501,7 +492,7 @@ audit_users_and_groups() {
     done
     
     print_sub "Processes Running as Root"
-    safe_exec ps -U root -u root u 2>/dev/null | head -40
+    ps -U root -u root u 2>/dev/null | head -40
 }
 
 audit_networking() {
@@ -519,7 +510,7 @@ audit_networking() {
         echo ""
         netstat -tnp 2>/dev/null | grep ESTABLISHED
     else
-        cat /proc/net/tcp 2>/dev/null | head -20
+        head -20 /proc/net/tcp 2>/dev/null
     fi
     
     print_sub "Active Internet Connections (UDP)"
@@ -572,32 +563,27 @@ audit_networking() {
     fi
     
     print_sub "Firewall Status"
-    # UFW (Debian/Ubuntu)
     if command -v ufw &>/dev/null; then
         echo "--- UFW ---"
         ufw status verbose 2>/dev/null || echo "(cannot get status)"
     fi
     
-    # Firewalld (RHEL/CentOS/Fedora)
     if command -v firewall-cmd &>/dev/null; then
         echo "--- Firewalld ---"
         echo "State: $(firewall-cmd --state 2>/dev/null || echo 'unknown')"
         firewall-cmd --list-all 2>/dev/null || true
     fi
     
-    # iptables (Universal)
     if command -v iptables &>/dev/null; then
         echo "--- iptables (filter table) ---"
         iptables -L -n -v --line-numbers 2>/dev/null | head -60
     fi
     
-    # nftables (Newer)
     if command -v nft &>/dev/null; then
         echo "--- nftables ---"
         nft list ruleset 2>/dev/null | head -60
     fi
     
-    # CSF (Common on cPanel servers)
     if command -v csf &>/dev/null; then
         echo "--- CSF Firewall ---"
         csf -s 2>/dev/null || true
@@ -685,16 +671,16 @@ audit_security() {
     
     print_sub "World Writable Files (Sample)"
     echo "Scanning... (timeout: 30s)"
-    safe_find / -xdev -type f -perm -0002 ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null | head -50
+    safe_find / -xdev -type f -perm -0002 2>/dev/null | head -50
     
     print_sub "World Writable Directories"
-    safe_find / -xdev -type d -perm -0002 ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null | head -30
+    safe_find / -xdev -type d -perm -0002 2>/dev/null | head -30
     
     print_sub "SUID Files (Potential Privilege Escalation)"
-    safe_find / -xdev -type f -perm -4000 ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null | head -50
+    safe_find / -xdev -type f -perm -4000 2>/dev/null | head -50
     
     print_sub "SGID Files"
-    safe_find / -xdev -type f -perm -2000 ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null | head -50
+    safe_find / -xdev -type f -perm -2000 2>/dev/null | head -50
     
     print_sub "Files with No Owner/Group"
     safe_find / -xdev \( -nouser -o -nogroup \) -type f 2>/dev/null | head -30
@@ -729,7 +715,7 @@ audit_security() {
         \( -name ".rhosts" -o -name ".netrc" -o -name ".forward" \) -type f 2>/dev/null
     
     print_sub "Sensitive Directory Permissions"
-    echo "/tmp  : $(ls -ld /tmp 2>/dev/null | awk '{print $1, $3, $4}')"
+    echo "/tmp    : $(ls -ld /tmp 2>/dev/null | awk '{print $1, $3, $4}')"
     echo "/var/tmp: $(ls -ld /var/tmp 2>/dev/null | awk '{print $1, $3, $4}')"
     echo "/dev/shm: $(ls -ld /dev/shm 2>/dev/null | awk '{print $1, $3, $4}')"
     
@@ -741,15 +727,14 @@ audit_security() {
         local hash_type
         hash_type=$(head -1 /etc/shadow 2>/dev/null | cut -d: -f2 | cut -c1-3)
         case "$hash_type" in
-            '$1$') echo "${RED}WARNING: Using MD5 (weak!)${NC}" ;;
-            '$5$') echo "${YELLOW}OK: Using SHA-256 (could be stronger)${NC}" ;;
-            '$6$') echo "${GREEN}OK: Using SHA-512 (recommended)${NC}" ;;
-            '$y$') echo "${GREEN}OK: Using yescrypt (modern)${NC}" ;;
-            '$2'$'') echo "${YELLOW}Using bcrypt${NC}" ;;
+            '$1$') echo "WARNING: Using MD5 (weak!)" ;;
+            '$5$') echo "OK: Using SHA-256 (could be stronger)" ;;
+            '$6$') echo "OK: Using SHA-512 (recommended)" ;;
+            '$y$') echo "OK: Using yescrypt (modern)" ;;
             *) echo "Unknown/Custom: $hash_type" ;;
         esac
     else
-        echo "${YELLOW}Cannot read /etc/shadow (root required)${NC}"
+        echo "Cannot read /etc/shadow (root required)"
     fi
     
     print_sub "SSH Authorized Keys"
@@ -781,10 +766,9 @@ audit_webserver() {
     nginx_service=$(get_webserver_service_name "nginx")
     apache_log_path=$(get_webserver_log_path "apache")
     
-    # Check Apache/httpd
     print_sub "Apache/httpd Status"
     if systemctl is-active --quiet "$apache_service" 2>/dev/null || pgrep -x "$apache_service" &>/dev/null; then
-        echo "${GREEN}[RUNNING] Service: $apache_service${NC}"
+        echo "[RUNNING] Service: $apache_service"
         echo "Log path: $apache_log_path"
         
         if [[ -d "$apache_log_path" ]]; then
@@ -807,13 +791,12 @@ audit_webserver() {
             done
         fi
     else
-        echo "${YELLOW}[NOT RUNNING] $apache_service${NC}"
+        echo "[NOT RUNNING] $apache_service"
     fi
     
-    # Check Nginx
     print_sub "Nginx Status"
     if systemctl is-active --quiet nginx 2>/dev/null || pgrep -x nginx &>/dev/null; then
-        echo "${GREEN}[RUNNING] Service: nginx${NC}"
+        echo "[RUNNING] Service: nginx"
         
         local nginx_log="/var/log/nginx"
         if [[ -d "$nginx_log" ]]; then
@@ -836,24 +819,19 @@ audit_webserver() {
             done
         fi
     else
-        echo "${YELLOW}[NOT RUNNING] nginx${NC}"
+        echo "[NOT RUNNING] nginx"
     fi
     
-    # Check other webservers
     print_sub "Other Webservers"
-    local -a other_servers=(lighttpd caddy tomcat httpd apache2)
+    local -a other_servers=(lighttpd caddy tomcat)
     for server in "${other_servers[@]}"; do
-        # Skip if already checked
         [[ "$server" == "$apache_service" ]] && continue
-        [[ "$server" == "nginx" ]] && continue
-        
         if systemctl is-active --quiet "$server" 2>/dev/null || pgrep -x "$server" &>/dev/null; then
-            echo "${GREEN}[RUNNING] $server${NC}"
+            echo "[RUNNING] $server"
             systemctl status "$server" --no-pager 2>/dev/null | head -15
         fi
     done
     
-    # Document roots
     print_sub "Web Document Roots"
     local -a doc_roots=(/var/www/html /var/www /srv/www /usr/share/nginx/html /var/www/vhosts /srv/http)
     for docroot in "${doc_roots[@]}"; do
@@ -881,7 +859,7 @@ audit_suspicious_files() {
     done | sort -u | head -50
     
     print_sub "Suspicious .bat Files (Unusual on Linux)"
-    safe_find / -type f -name "*.bat" ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null | head -20
+    safe_find / -type f -name "*.bat" 2>/dev/null | head -20
     
     print_sub "Suspicious Shell Scripts"
     local -a shell_patterns=("curl " "wget " "nc " "netcat " "bash -i" "sh -i" "/dev/tcp" "mkfifo" "mknod" "socat TCP" "openssl s_client")
@@ -925,7 +903,7 @@ audit_mining() {
     local mining_procs
     mining_procs=$(ps aux 2>/dev/null | grep -iE "$(IFS='|'; echo "${mining_patterns[*]}")" | grep -v grep)
     if [[ -n "$mining_procs" ]]; then
-        echo "${RED}SUSPICIOUS: Mining processes found!${NC}"
+        echo "SUSPICIOUS: Mining processes found!"
         echo "$mining_procs"
     else
         echo "(no mining processes detected)"
@@ -936,7 +914,7 @@ audit_mining() {
         local mining_services
         mining_services=$(systemctl list-units --type=service --all --no-pager 2>/dev/null | grep -iE "$(IFS='|'; echo "${mining_patterns[*]}")")
         if [[ -n "$mining_services" ]]; then
-            echo "${RED}SUSPICIOUS: Mining services found!${NC}"
+            echo "SUSPICIOUS: Mining services found!"
             echo "$mining_services"
         else
             echo "(no mining services detected)"
@@ -946,14 +924,14 @@ audit_mining() {
     print_sub "Mining-related Files"
     local -a mining_filenames=("*xmrig*" "*minerd*" "*cryptonight*" "*cpuminer*" "*xmr-stak*")
     for pattern in "${mining_filenames[@]}"; do
-        safe_find / -type f -name "$pattern" ! -path "/proc/*" ! -path "/sys/*" 2>/dev/null
+        safe_find / -type f -name "$pattern" 2>/dev/null
     done | head -30
     
     print_sub "Connections to Common Mining Ports"
     local -a mining_ports=("4444" "3333" "5555" "14444" "45560" "45700" "8888" "7777" "9999" "3357")
     if command -v ss &>/dev/null; then
         for port in "${mining_ports[@]}"; do
-            ss -tnp 2>/dev/null | grep ":$port " && echo "${RED}Connection to mining port $port detected!${NC}"
+            ss -tnp 2>/dev/null | grep ":$port " && echo "Connection to mining port $port detected!"
         done
         echo "(scan complete)"
     fi
@@ -963,14 +941,13 @@ audit_mining() {
     
     print_sub "Docker Containers for Mining"
     if command -v docker &>/dev/null; then
-        docker ps --format "{{.Names}}: {{.Image}}" 2>/dev/null | grep -iE "$(IFS='|'; echo "${mining_patterns[*]}")" && echo "${RED}Mining container detected!${NC}" || echo "(no mining containers)"
+        docker ps --format "{{.Names}}: {{.Image}}" 2>/dev/null | grep -iE "$(IFS='|'; echo "${mining_patterns[*]}")" && echo "Mining container detected!" || echo "(no mining containers)"
     fi
 }
 
 audit_containers() {
     print_header "CONTAINER & VIRTUALIZATION CHECKS"
     
-    # Docker
     print_sub "Docker"
     if command -v docker &>/dev/null; then
         echo "--- Version ---"
@@ -1000,14 +977,13 @@ audit_containers() {
         echo "--- Privileged Containers ---"
         docker ps --format '{{.Names}}' 2>/dev/null | while read -r container; do
             if docker inspect "$container" 2>/dev/null | grep -q '"Privileged": true'; then
-                echo "${RED}WARNING: $container is running privileged!${NC}"
+                echo "WARNING: $container is running privileged!"
             fi
         done
     else
         echo "(Docker not installed)"
     fi
     
-    # Podman
     print_sub "Podman"
     if command -v podman &>/dev/null; then
         podman ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null
@@ -1017,7 +993,6 @@ audit_containers() {
         echo "(Podman not installed)"
     fi
     
-    # LXC/LXD
     print_sub "LXC/LXD"
     if command -v lxc &>/dev/null; then
         lxc list 2>/dev/null || lxc-ls -fancy 2>/dev/null
@@ -1025,7 +1000,6 @@ audit_containers() {
         echo "(LXC/LXD not installed)"
     fi
     
-    # KVM/QEMU
     print_sub "KVM/QEMU Virtual Machines"
     if command -v virsh &>/dev/null; then
         virsh list --all 2>/dev/null
@@ -1044,7 +1018,7 @@ audit_additional_security() {
     local suspicious_modules
     suspicious_modules=$(lsmod 2>/dev/null | grep -iE "hide|rootkit|kit|invisible|cloak")
     if [[ -n "$suspicious_modules" ]]; then
-        echo "${RED}SUSPICIOUS: $suspicious_modules${NC}"
+        echo "SUSPICIOUS: $suspicious_modules"
     else
         echo "(no suspicious modules)"
     fi
@@ -1055,7 +1029,7 @@ audit_additional_security() {
     print_sub "LD_PRELOAD Check"
     echo "Current LD_PRELOAD: ${LD_PRELOAD:-Not set}"
     if [[ -f /etc/ld.so.preload ]]; then
-        echo "${RED}WARNING: /etc/ld.so.preload exists!${NC}"
+        echo "WARNING: /etc/ld.so.preload exists!"
         cat /etc/ld.so.preload 2>/dev/null
     else
         echo "/etc/ld.so.preload: (not found - good)"
@@ -1209,8 +1183,8 @@ main() {
     
     echo "  ██╗     ██╗███╗   ██╗██╗   ██╗██╗  ██╗ █████╗ ██╗   ██╗██████╗ ██╗████████╗██╗     ██╗   ██╗██████╗  "
     echo "  ██║     ██║████╗  ██║██║   ██║╚██╗██╔╝██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝██║     ██║   ██║██╔══██╗ "
-    echo "  ██║     ██║██╔██╗ ██║██║   ██╗ ╚███╔╝ ███████║██║   ██║██║  ██║██║   ██║   ██║     ██║   ██║██████╔╝ "
-    echo "  ██║     ██║██║╚██╗██║██║   ██╗ ██╔██╗ ██╔══██║██║   ██║██║  ██║██║   ██║   ██║     ██║   ██║██╔══██╗ "
+    echo "  ██║     ██║██╔██╗ ██║██║   ██╗ ╚███╔╝ ███████║██╗   ██╗██║  ██║██║   ██║   ██║     ██║   ██║██████╔╝ "
+    echo "  ██║     ██║██║╚██╗██║██║   ██╗ ██╔██╗ ██╔══██║██║   ██╗██╗  ██║██║   ██║   ██║     ██║   ██║██╔══██╗ "
     echo "  ███████╗██║██║ ╚████║╚██████╔╝██╔╝ ██╗██║  ██║╚██████╔╝██████╔╝██║   ██║   ███████╗╚██████╔╝██║  ██║ "
     echo "  ╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝   ╚══════╝ ╚═════╝ ╚═╝  ╚═╝ "
     echo ""
@@ -1269,7 +1243,7 @@ main() {
         else
             cp "$TEMP_OUTPUT" "$OUTPUT_FILE"
         fi
-
+        
         if [[ -f "$OUTPUT_FILE" ]] && [[ -s "$OUTPUT_FILE" ]]; then
             echo ""
             echo -e "${GREEN}═══════════════════════════════════════════════════════════════════════════════${NC}"
@@ -1287,7 +1261,7 @@ main() {
     else
         echo -e "${RED}ERROR: Gagal membuat file temporary${NC}" >&2
     fi
-
+    
     if [[ -f "$LOG_FILE" ]] && [[ -s "$LOG_FILE" ]]; then
         echo ""
         echo -e "${YELLOW}[!] Ada error selama audit. Detail: $LOG_FILE${NC}"
